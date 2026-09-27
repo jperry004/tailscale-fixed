@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tailscale Doctor</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <img src="favicon.svg" alt="" width="28" height="28">
+      <div>
+        <h1>Tailscale Doctor</h1>
+        <div class="sub" id="machine">Connecting…</div>
+      </div>
+    </div>
+    <div class="top-actions">
+      <button class="btn ghost" id="btn-copy" type="button">Copy summary</button>
+      <button class="btn ghost" id="btn-export" type="button">Save report</button>
+      <button class="btn ghost" id="btn-quit" type="button">Quit</button>
+    </div>
+  </header>
+
+  <main>
+    <div id="banner" class="banner hidden" role="alert"></div>
+
+    <section class="card verdict" id="verdict" data-state="idle">
+      <div class="verdict-icon" id="verdict-icon" aria-hidden="true">?</div>
+      <div class="verdict-body">
+        <h2 id="verdict-title">Ready to check this PC</h2>
+        <p id="verdict-text">Click <b>Fix everything automatically</b> to find and repair problems, or <b>Run full check</b> to only look.</p>
+        <div class="progress hidden" id="progress"><div class="bar" id="progress-bar"></div></div>
+        <div class="progress-label" id="progress-label"></div>
+      </div>
+      <div class="verdict-actions">
+        <button class="btn primary big" id="btn-autofix" type="button">Fix everything automatically</button>
+        <button class="btn" id="btn-check" type="button">Run full check</button>
+        <button class="btn" id="btn-login-open" type="button">Log in…</button>
+      </div>
+    </section>
+
+    <section class="card hidden" id="login-card">
+      <div class="card-head">
+        <h2>Log this PC in to Tailscale</h2>
+        <button class="btn ghost small" id="btn-login-close" type="button">Close</button>
+      </div>
+      <div class="tabs" role="tablist">
+        <button class="tab active" data-tab="key" role="tab" type="button">Auth key (recommended)</button>
+        <button class="tab" data-tab="browser" role="tab" type="button">Browser sign-in</button>
+      </div>
+
+      <div class="tab-panel" data-panel="key">
+        <p class="muted">Create a key at <a href="https://login.tailscale.com/admin/settings/keys" target="_blank" rel="noopener noreferrer">admin console → Settings → Keys</a>. For business machines use a <b>reusable, pre-approved</b> key, optionally tagged. The key is sent only to the local Tailscale CLI and is never saved.</p>
+        <label class="field">
+          <span>Auth key</span>
+          <div class="row">
+            <input id="authkey" type="password" autocomplete="off" spellcheck="false" placeholder="tskey-auth-…">
+            <button class="btn small" id="btn-showkey" type="button">Show</button>
+          </div>
+        </label>
+      </div>
+      <div class="tab-panel hidden" data-panel="browser">
+        <p class="muted">Gets a sign-in link from Tailscale. Open it, sign in, approve, and this page notices automatically.</p>
+        <div id="login-link-box" class="hidden linkbox">
+          <a id="login-link" href="#" target="_blank" rel="noopener noreferrer"></a>
+          <div class="muted small" id="login-wait">Waiting for you to finish signing in…</div>
+        </div>
+      </div>
+
+      <details class="options" open>
+        <summary>Options</summary>
+        <label class="check"><input type="checkbox" id="opt-unattended" checked> Stay connected when nobody is signed in to Windows (unattended mode) — recommended for business PCs</label>
+        <label class="check"><input type="checkbox" id="opt-routes"> Use subnet routes advertised by other devices (<code>--accept-routes</code>)</label>
+        <label class="field"><span>Device name (optional)</span><input id="opt-hostname" type="text" spellcheck="false" placeholder="e.g. office-pc-1"></label>
+        <label class="field"><span>Tags (optional, comma-separated)</span><input id="opt-tags" type="text" spellcheck="false" placeholder="e.g. tag:server"></label>
+        <p class="muted small">Tags give the device an identity whose login does not expire. Each tag must already exist in your tailnet policy with you (or the key) as a tagOwner.</p>
+      </details>
+      <div class="row end">
+        <button class="btn primary" id="btn-login-go" type="button">Log in</button>
+      </div>
+      <div id="login-result"></div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>Checks</h2>
+        <span class="muted small" id="checks-meta"></span>
+      </div>
+      <ol class="checks" id="checks"></ol>
+    </section>
+
+    <section class="card" id="actions-card">
+      <div class="card-head">
+        <h2>What was done</h2>
+        <button class="btn ghost small" id="btn-clear-actions" type="button">Clear</button>
+      </div>
+      <div id="actions"><p class="muted">Nothing yet.</p></div>
+    </section>
+
+    <section class="card">
+      <details id="log-details">
+        <summary><h2 class="inline">Detailed activity log</h2> <span class="muted small" id="log-path"></span></summary>
+        <pre class="log" id="log"></pre>
+      </details>
+    </section>
+  </main>
+
+  <footer class="foot muted small">
+    Runs only on this PC (127.0.0.1). Keep the black console window open while you use this page.
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
