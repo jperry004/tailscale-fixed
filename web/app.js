@@ -9,7 +9,7 @@
   // ---------------------------------------------------------------------------
   const STATUS_ICON = { ok: '✓', warn: '!', fail: '✕', error: '✕', info: 'i', skip: '–', running: '…', pending: '' };
   // After these fixes, everything must be re-checked before trying more fixes.
-  const STRUCTURAL = new Set(['install', 'repair', 'update', 'start-service', 'restart-service', 'reset-state', 'reset-winhttp-proxy']);
+  const STRUCTURAL = new Set(['install', 'repair', 'update', 'start-service', 'restart-service', 'reset-state', 'reset-winhttp-proxy', 'tpm-recover', 'dns-repair', 'fix-dependencies']);
   const CHECK_TIMEOUT_MS = 3 * 60 * 1000;
   const ACTION_TIMEOUT_MS = 30 * 60 * 1000;
 
@@ -150,7 +150,13 @@
       state.results[id] = { ...state.results[id], status: 'running', summary: 'Checking…' };
       renderCheck(id);
       try {
-        state.results[id] = await api('/api/check', { id, fresh: i === 0 }, CHECK_TIMEOUT_MS);
+        try {
+          state.results[id] = await api('/api/check', { id, fresh: i === 0 }, CHECK_TIMEOUT_MS);
+        } catch (first) {
+          if (state.serverDown) throw first;
+          await sleep(1500);   // one retry for transient hiccups
+          state.results[id] = await api('/api/check', { id }, CHECK_TIMEOUT_MS);
+        }
       } catch (e) {
         state.results[id] = { id, title: titleOf(id), status: 'error', summary: e.message, details: [], advice: [], fixes: [] };
         if (state.serverDown) { renderCheck(id); throw e; }

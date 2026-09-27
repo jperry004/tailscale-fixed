@@ -25,6 +25,10 @@
 
 .PARAMETER NoElevate
     Do not try to relaunch as Administrator. Most fixes will fail without admin.
+
+.PARAMETER LoadOnly
+    For automated tests: dot-source the script to load its functions, without
+    starting the server or changing anything.
 #>
 [CmdletBinding()]
 param(
@@ -32,7 +36,8 @@ param(
     [switch]$NoBrowser,
     [switch]$Cli,
     [string]$ReportPath,
-    [switch]$NoElevate
+    [switch]$NoElevate,
+    [switch]$LoadOnly
 )
 
 # NOTE: keep this file pure ASCII. Windows PowerShell 5.1 reads BOM-less files
@@ -43,6 +48,7 @@ $ErrorActionPreference = 'Stop'
 
 # Last line of defence: never vanish silently. Show the error and wait.
 trap {
+    if ($LoadOnly) { break }   # tests handle their own errors
     Write-Host ''
     Write-Host ('FATAL ERROR: ' + $_.Exception.Message) -ForegroundColor Red
     Write-Host ($_.InvocationInfo.PositionMessage) -ForegroundColor DarkGray
@@ -50,7 +56,7 @@ trap {
     if (-not $NoBrowser) { try { [void](Read-Host 'Press Enter to close') } catch { } }
     exit 1
 }
-$script:DoctorVersion = '1.0.0'
+$script:DoctorVersion = '1.1.0'
 $script:IsWin = ($env:OS -eq 'Windows_NT')
 $script:Running = $true
 $script:RebootNeeded = $false
@@ -69,7 +75,7 @@ function Test-Admin {
 }
 
 $script:IsAdmin = Test-Admin
-if ($script:IsWin -and -not $script:IsAdmin -and -not $NoElevate) {
+if ($script:IsWin -and -not $script:IsAdmin -and -not $NoElevate -and -not $LoadOnly) {
     try {
         $hostExe = (Get-Process -Id $PID).Path
         $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $PSCommandPath + '"'))
@@ -357,6 +363,18 @@ function Get-ErrorHints([string]$Text) {
     if ($t -match 'proxy') {
         [void]$h.Add('A proxy is involved. Check the Proxy check below: the Tailscale service runs as SYSTEM and uses the machine-wide (WinHTTP) proxy settings.')
     }
+    if ($t -match 'unseal|TPM_RC_|tpm2\.|TPM') {
+        [void]$h.Add('Tailscale cannot decrypt its saved state with this PC''s TPM chip (typical after a BIOS/TPM update, motherboard change, disk migration or VM snapshot restore). Use "Recover from TPM failure", then log in again.')
+    }
+    if ($t -match 'set-network-category|network category') {
+        [void]$h.Add('Windows would not let Tailscale set the network type. Restart the service; make sure "Network List Service" and "Network Location Awareness" are not disabled.')
+    }
+    if ($t -match 'sufficient privileges to start system services|Error 1920|IP Helper|iphlpsvc') {
+        [void]$h.Add('The installer could not start the Tailscale service. Most often a Windows service it needs (IP Helper, Base Filtering Engine) was disabled; see "Windows services Tailscale needs".')
+    }
+    if ($t -match 'ProtectedPrefix') {
+        [void]$h.Add('The service cannot create its control pipe. Restart the service; if it persists, security software is blocking named pipes for tailscaled.exe - add an exclusion.')
+    }
     if ($t -match 'unknown subcommand|flag provided but not defined|unknown flag') {
         [void]$h.Add('This Tailscale version is too old for this command. Use "Update Tailscale".')
     }
@@ -615,7 +633,7 @@ function Get-ServiceInfo {
     $r = [ordered]@{ exists = $false; state = $null; startMode = $null; path = $null; exePath = $null; processId = $null; error = $null }
     if (-not $script:IsWin) { $r.error = 'Not Windows'; return $r }
     try {
-        $s = Get-CimInstance -ClassName Win32_Service -Filter "Name='Tailscale'" -ErrorAction Stop
+        $s = Get-CimInstance -ClassName Win32_Service -Filter "Name='Tailscale'" -OperationTimeoutSec 20 -ErrorAction Stop
         if ($s) {
             $r.exists = $true; $r.state = $s.State; $r.startMode = $s.StartMode; $r.path = $s.PathName; $r.processId = $s.ProcessId
         }
@@ -748,6 +766,27 @@ function Get-TsLogDir {
     return $null
 }
 
+# Latest tailscaled log (tail), shared by several checks. Cached briefly.
+function Get-RecentTsLog {
+    return Get-Cached 'tslog' 20 {
+        $r = [ordered]@{ file = $null; modified = $null; lines = @() }
+        $dir = Get-TsLogDir
+        if (-not $dir) { return $r }
+        $files = @(Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'tailscaled' -and $_.Extension -in @('.txt', '.log') } | Sort-Object LastWriteTime -Descending)
+        if (-not $files.Count) { $files = @(Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending) }
+        if (-not $files.Count) { return $r }
+        $r.file = $files[0].FullName
+        $r.modified = $files[0].LastWriteTime
+        $r.lines = @((Read-FileTail $r.file 262144) -split "`r?`n" | Select-Object -Last 1500)
+        return $r
+    }
+}
+
+function Test-TpmFailure {
+    $log = Get-RecentTsLog
+    return (@($log.lines | Where-Object { $_ -match 'unseal|TPM_RC_|tpm2\.|TPM.*(fail|error)' }).Count -gt 0)
+}
+
 # ---------------------------------------------------------------------------
 # Result helpers
 # ---------------------------------------------------------------------------
@@ -783,7 +822,7 @@ function Add-Fix($R, $Fix) {
 function Test-System {
     $r = New-Result 'system' 'Windows and permissions'
     $os = $null
-    try { $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop } catch { }
+    try { $os = Get-CimInstance Win32_OperatingSystem -OperationTimeoutSec 20 -ErrorAction Stop } catch { }
     $ver = [Environment]::OSVersion.Version
     $caption = if ($os) { $os.Caption } else { [Environment]::OSVersion.VersionString }
     $r.data.os = $caption
@@ -816,7 +855,7 @@ function Test-System {
         }
         try {
             $sysDrive = if ($env:SystemDrive) { $env:SystemDrive } else { 'C:' }
-            $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$sysDrive'" -ErrorAction Stop
+            $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$sysDrive'" -OperationTimeoutSec 20 -ErrorAction Stop
             $freeMb = [int]($disk.FreeSpace / 1MB)
             $r.details += "Free space on ${sysDrive}: $freeMb MB"
             if ($freeMb -lt 500) { Set-Status $r 'warn' "Very low disk space on $sysDrive ($freeMb MB). Installs and Tailscale state writes can fail." }
@@ -931,14 +970,33 @@ function Test-Daemon {
     $r = New-Result 'daemon' 'Tailscale service responding'
     if (-not (Get-TsExe)) { $r.status = 'skip'; $r.summary = 'Tailscale is not installed'; return $r }
     $st = Get-TsStatus
+    $svc = Get-ServiceInfo
+    # A second tailscaled (started by hand, or left over after a crash) fights the
+    # service for the control pipe: symptoms are hangs and "Logged out" at random.
+    $strays = @()
+    if ($script:IsWin) {
+        $strays = @(Get-Process -Name tailscaled -ErrorAction SilentlyContinue | Where-Object { -not $svc.processId -or $_.Id -ne $svc.processId })
+        $guis = @(Get-Process -Name 'tailscale-ipn' -ErrorAction SilentlyContinue)
+        if ($guis.Count -gt 1) { $r.details += "$($guis.Count) copies of the tray app are running (one per signed-in user is normal)." }
+    }
+    if ($strays.Count -and $svc.processId) {
+        $r.details += ('Extra tailscaled.exe processes (not the service): ' + (($strays | ForEach-Object { $_.Id }) -join ', '))
+        Set-Status $r 'fail' 'An extra copy of tailscaled.exe is running next to the service; they fight over the connection.'
+        Add-Fix $r (New-Fix 'restart-service' 'Restart Tailscale service (kills the extra copy)' -Auto -Primary)
+    }
     if ($st.reachable) {
-        $r.summary = 'The service answers commands.'
+        if ($r.status -eq 'ok') { $r.summary = 'The service answers commands.' }
         $r.details += "Backend state: $($st.json.BackendState)"
         if ($st.json.Version) { $r.details += "Daemon version: $($st.json.Version)" }
         return $r
     }
-    $svc = Get-ServiceInfo
-    if ($st.timedOut) { Set-Status $r 'fail' 'The service is running but hung: it does not answer within 20 seconds.' }
+    if (Test-TpmFailure) {
+        Set-Status $r 'fail' 'Tailscale cannot start because it cannot decrypt its state file with this PC''s TPM chip.'
+        $r.advice += 'This happens after a BIOS/TPM firmware update, TPM reset, motherboard replacement, disk migration or VM snapshot restore. Recovery moves the unreadable file aside; you then log in again.'
+        Add-Fix $r (New-Fix 'tpm-recover' 'Recover from TPM failure' -Auto -Primary -Confirm 'Move the unreadable Tailscale state file aside and restart? This device must log in again afterwards.')
+    }
+    if ($r.status -eq 'fail') { }   # a more specific diagnosis (TPM, extra daemon) is already set
+    elseif ($st.timedOut) { Set-Status $r 'fail' 'The service is running but hung: it does not answer within 20 seconds.' }
     elseif ($svc.exists -and $svc.state -ne 'Running') { Set-Status $r 'fail' 'The service is not running, so the CLI cannot talk to it.' }
     else { Set-Status $r 'fail' 'The Tailscale CLI cannot talk to the service.' }
     if ($st.error) { $r.details += "Error: $($st.error)" }
@@ -1032,6 +1090,17 @@ function Test-Backend {
                 Set-Status $r 'warn' $(if ($state -eq 'Running') { 'Connected, but it will disconnect when you sign out of Windows (unattended mode off).' } else { $null })
                 Add-Fix $r (New-Fix 'enable-unattended' 'Turn on unattended mode' -Auto)
             }
+        }
+    }
+    if ($j.ExitNodeStatus -and $j.ExitNodeStatus.ID) {
+        $en = $j.ExitNodeStatus
+        $r.details += ('Exit node in use: ' + (@($en.TailscaleIPs) -join ', ') + ' (online: ' + [bool]$en.Online + ')')
+        if (-not $en.Online) {
+            Set-Status $r 'fail' 'All internet traffic is routed through an exit node that is OFFLINE, so this PC has no internet.'
+            $r.advice += 'Clear the exit node to restore internet, then choose a working one in the Tailscale menu if needed. Exit nodes can also break after sleep/resume; the watchdog helps with that.'
+            Add-Fix $r (New-Fix 'clear-exit-node' 'Stop using the exit node' -Auto -Primary)
+        } else {
+            Add-Fix $r (New-Fix 'clear-exit-node' 'Stop using the exit node')
         }
     }
     if ($state -eq 'Running' -and $j.Self -and ($j.Self.PSObject.Properties.Name -contains 'Online') -and -not $j.Self.Online) {
@@ -1317,7 +1386,7 @@ function Get-SecurityProducts {
         $found = New-Object System.Collections.ArrayList
         if (-not $script:IsWin) { return , @() }
         try {
-            $av = Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName AntiVirusProduct -ErrorAction Stop
+            $av = Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName AntiVirusProduct -OperationTimeoutSec 20 -ErrorAction Stop
             foreach ($a in $av) {
                 # productState bits 12-13: 0x1000 = enabled.
                 $enabled = (([int]$a.productState -band 0x1000) -ne 0)
@@ -1325,7 +1394,7 @@ function Get-SecurityProducts {
             }
         } catch { }
         try {
-            $fw = Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName FirewallProduct -ErrorAction Stop
+            $fw = Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName FirewallProduct -OperationTimeoutSec 20 -ErrorAction Stop
             foreach ($a in $fw) { [void]$found.Add([ordered]@{ name = $a.displayName; kind = 'Firewall'; enabled = ((([int]$a.productState -band 0x1000) -ne 0)) }) }
         } catch { }
         $procMap = @{ 'vsserv' = 'Bitdefender'; 'bdservicehost' = 'Bitdefender'; 'bdagent' = 'Bitdefender'; 'avp' = 'Kaspersky'; 'ekrn' = 'ESET'; 'AvastSvc' = 'Avast'; 'AVGSvc' = 'AVG';
@@ -1415,6 +1484,20 @@ function Test-Vpn {
         if (-not $routes.Count) { Set-Status $r 'fail' 'This PC has no default route: no internet connection.' }
     } catch { $r.details += 'Could not read routes: ' + (Get-InnerMessage $_) }
 
+    # Teredo/IPv6 flapping makes Tailscale rebind over and over (high CPU in the
+    # DNS Client service, connections dropping every few seconds).
+    $flaps = @((Get-RecentTsLog).lines | Where-Object { $_ -match 'LinkChange: major' }).Count
+    if ($flaps) { $r.details += "Major network changes in the recent Tailscale log: $flaps" }
+    $teredo = Invoke-Proc 'netsh.exe' @('interface', 'teredo', 'show', 'state') 10 -Quiet
+    $tState = if ($teredo.stdout -match 'State\s*:\s*(\S+)') { $Matches[1] } else { $null }
+    if ($tState) { $r.details += "Teredo (IPv6 tunnel): $tState" }
+    if ($flaps -ge 30) {
+        Set-Status $r 'warn' "The network keeps changing ($flaps major changes in the recent log): Tailscale reconnects over and over."
+        $r.advice += 'Usual culprits: the Teredo IPv6 tunnel, an unstable Wi-Fi/USB adapter, or other virtual adapters (VPNs, ZeroTier, Hyper-V) going up and down. Symptoms: connections drop every few seconds, high CPU in "DNS Client" (svchost).'
+        if ($tState -and $tState -notmatch 'disabled|offline') { Add-Fix $r (New-Fix 'disable-teredo' 'Disable Teredo' -Auto -Primary) }
+    } elseif ($tState -and $tState -notmatch 'disabled|offline') {
+        Add-Fix $r (New-Fix 'disable-teredo' 'Disable Teredo (IPv6 tunnel)' -Confirm 'Disable the Teredo IPv6 tunnel? Almost nothing uses it today; re-enable with: netsh interface teredo set state default')
+    }
     if ($vpns.Count) {
         $names = ($vpns | ForEach-Object { $_.Name }) -join ', '
         Set-Status $r 'warn' "Another VPN is connected ($names). VPNs commonly block or reroute Tailscale traffic."
@@ -1566,12 +1649,20 @@ function Test-State {
         if ($fi.Length -eq 0 -or -not $txt.Trim()) {
             Set-Status $r 'fail' 'The Tailscale state file is empty (corrupted).'
         } else {
-            try { $null = $txt | ConvertFrom-Json; $r.summary = 'State file is valid.' } catch {
-                Set-Status $r 'fail' 'The Tailscale state file is corrupted (not valid JSON).'
+            try { $null = $txt | ConvertFrom-Json; $r.summary = 'State file is valid (not encrypted).' } catch {
+                # Newer versions can encrypt the state with the TPM, so non-JSON
+                # is only a problem when the service can't read it.
+                if (Test-TpmFailure) {
+                    Set-Status $r 'fail' 'The state file is TPM-encrypted and this PC''s TPM can no longer decrypt it.'
+                    $r.advice += 'Common after BIOS/TPM firmware updates, motherboard swaps, disk migration or VM restores.'
+                    Add-Fix $r (New-Fix 'tpm-recover' 'Recover from TPM failure' -Auto -Primary -Confirm 'Move the unreadable Tailscale state file aside and restart? This device must log in again afterwards.')
+                } else {
+                    $r.status = 'info'; $r.summary = 'State file is encrypted with the TPM (fine while Tailscale can read it).'
+                }
             }
         }
     } else { $r.summary = 'No saved state (not logged in yet).' }
-    if ($r.status -eq 'fail') {
+    if ($r.status -eq 'fail' -and -not ($r.fixes | Where-Object { $_.action -eq 'tpm-recover' })) {
         $r.advice += 'Resetting the state backs up the old files and starts clean. You will need to log in again.'
         Add-Fix $r (New-Fix 'reset-state' 'Reset Tailscale state' -Auto -Primary -Confirm 'Reset Tailscale state? The old state is backed up, and this device must log in again.')
     } else {
@@ -1588,20 +1679,19 @@ $script:LogPatterns = @(
     @{ re = 'Access is denied'; msg = 'Access denied errors (permissions or security software blocking).'; sev = 'warn' },
     @{ re = 'node key expired|NodeKeyExpired'; msg = 'The node key expired: log in again.'; sev = 'warn' },
     @{ re = 'panic:|fatal error:'; msg = 'The Tailscale service crashed recently.'; sev = 'warn' },
+    @{ re = 'unseal|TPM_RC_|tpm2\.'; msg = 'TPM errors: Tailscale cannot decrypt its state file (after a BIOS/TPM update, motherboard change, disk migration or VM restore).'; sev = 'warn' },
+    @{ re = 'set-network-category|SetNetworkCategory|network category'; msg = 'Windows refused to set the Tailscale network category.'; sev = 'warn' },
+    @{ re = 'LinkChange: major'; msg = 'Network changes (many of these in a short time means a flapping adapter, e.g. Teredo/IPv6 or another VPN).'; sev = 'info' },
+    @{ re = 'ProtectedPrefix.*(denied|Access)|pipe.*Access is denied'; msg = 'The service could not create its control pipe (access denied).'; sev = 'warn' },
     @{ re = 'proxy'; msg = 'Proxy-related messages.'; sev = 'info' }
 )
 
 function Test-Logs {
     $r = New-Result 'logs' 'Tailscale service logs'
-    $dir = Get-TsLogDir
-    if (-not $dir) { $r.status = 'skip'; $r.summary = 'No Tailscale log folder found.'; return $r }
-    $files = @(Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'tailscaled' -and $_.Extension -in @('.txt', '.log') } | Sort-Object LastWriteTime -Descending)
-    if (-not $files.Count) { $files = @(Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending) }
-    if (-not $files.Count) { $r.status = 'skip'; $r.summary = 'Log folder is empty.'; return $r }
-    $f = $files[0]
-    $r.details += "Log: $($f.FullName) (modified $($f.LastWriteTime.ToString('yyyy-MM-dd HH:mm')))"
-    $text = Read-FileTail $f.FullName 262144
-    $lines = @($text -split "`r?`n" | Select-Object -Last 1500)
+    $log = Get-RecentTsLog
+    if (-not $log.file) { $r.status = 'skip'; $r.summary = 'No Tailscale log file found.'; return $r }
+    $r.details += "Log: $($log.file) (modified $($log.modified.ToString('yyyy-MM-dd HH:mm')))"
+    $lines = @($log.lines)
     $hits = @()
     foreach ($pat in $script:LogPatterns) {
         $m = @($lines | Where-Object { $_ -match $pat.re })
@@ -1620,8 +1710,224 @@ function Test-Logs {
     return $r
 }
 
+# ---------------------------------------------------------------------------
+# Checks added for the most common Windows Tailscale problems
+# ---------------------------------------------------------------------------
+
+# Windows services Tailscale (or its installer) depends on. Disabling these
+# "to debloat" is a top cause of "Service 'Tailscale' failed to start. Verify
+# that you have sufficient privileges to start system services" (install error).
+$script:DependencyServices = @(
+    @{ name = 'iphlpsvc'; label = 'IP Helper'; start = 'Automatic'; running = $true; why = 'Tailscale''s installer and service need it (known cause of "failed to start ... sufficient privileges").' },
+    @{ name = 'BFE'; label = 'Base Filtering Engine'; start = 'Automatic'; running = $true; why = 'Tailscale programs its firewall rules through it.' },
+    @{ name = 'nsi'; label = 'Network Store Interface'; start = 'Automatic'; running = $true; why = 'Needed to create and configure network adapters.' },
+    @{ name = 'Dnscache'; label = 'DNS Client'; start = 'Automatic'; running = $true; why = 'MagicDNS (device names) relies on it.' },
+    @{ name = 'NlaSvc'; label = 'Network Location Awareness'; start = 'Automatic'; running = $true; why = 'Windows needs it to classify the Tailscale network (Private/Public).' },
+    @{ name = 'netprofm'; label = 'Network List Service'; start = 'Manual'; running = $false; why = 'Needed to set the Tailscale network to Private ("set-network-category-failed").' },
+    @{ name = 'WinHttpAutoProxySvc'; label = 'WinHTTP Web Proxy Auto-Discovery'; start = 'Manual'; running = $false; why = 'The Tailscale service uses it to find proxies.' },
+    @{ name = 'msiserver'; label = 'Windows Installer'; start = 'Manual'; running = $false; why = 'Needed to install or update Tailscale.' }
+)
+
+function Test-Dependencies {
+    $r = New-Result 'deps' 'Windows services Tailscale needs'
+    if (-not $script:IsWin) { $r.status = 'skip'; $r.summary = 'Windows only'; return $r }
+    $broken = @()
+    foreach ($d in $script:DependencyServices) {
+        try {
+            $s = Get-Service -Name $d.name -ErrorAction Stop
+            $r.details += "$($d.label) ($($d.name)): $($s.Status), start type $($s.StartType)"
+            if ([string]$s.StartType -eq 'Disabled') { $broken += "$($d.label) is DISABLED - $($d.why)" }
+            elseif ($d.running -and [string]$s.Status -ne 'Running') { $broken += "$($d.label) is not running - $($d.why)" }
+        } catch { $r.details += "$($d.label) ($($d.name)): not present" }
+    }
+    if ($broken.Count) {
+        Set-Status $r 'fail' ("$($broken.Count) Windows service(s) Tailscale depends on are disabled or stopped.")
+        foreach ($b in $broken) { $r.advice += $b }
+        $r.advice += 'These are often turned off by "debloat"/"privacy" tools or hardening scripts. The fix restores Windows'' default start types; some protected services only take effect after a reboot.'
+        Add-Fix $r (New-Fix 'fix-dependencies' 'Re-enable required Windows services' -Auto -Primary)
+    } else { $r.summary = 'All required Windows services are enabled.' }
+    return $r
+}
+
+function Test-Inbound {
+    $r = New-Result 'inbound' 'Reaching this PC over Tailscale (network type, ping)'
+    if (-not $script:IsWin) { $r.status = 'skip'; $r.summary = 'Windows only'; return $r }
+    $st = Get-TsStatus
+    if (-not ($st.reachable -and $st.json.BackendState -eq 'Running')) { $r.status = 'skip'; $r.summary = 'Only checked while Tailscale is connected.'; return $r }
+    try {
+        $prof = @(Get-NetConnectionProfile -ErrorAction Stop | Where-Object { $_.InterfaceAlias -like 'Tailscale*' })
+    } catch { $prof = @(); $r.details += 'Could not read network profiles: ' + (Get-InnerMessage $_) }
+    if (-not $prof.Count) {
+        Set-Status $r 'warn' 'Windows has not classified the Tailscale network yet (Network List Service problem).'
+        $r.advice += 'Tailscale reports this as "set-network-category-failed". Restart the Tailscale service; if it persists, check that the Network List Service and Network Location Awareness are enabled (see the Windows services check).'
+        Add-Fix $r (New-Fix 'restart-service' 'Restart Tailscale service')
+    }
+    foreach ($p in $prof) {
+        $r.details += "$($p.InterfaceAlias): network category $($p.NetworkCategory)"
+        if ([string]$p.NetworkCategory -eq 'Public') {
+            Set-Status $r 'warn' 'Windows treats the Tailscale network as PUBLIC, so it blocks Remote Desktop, file sharing and ping from your other devices.'
+            $r.advice += 'Tailscale traffic is already authenticated and encrypted, so marking it Private is safe. If it keeps reverting to Public, a Group Policy (Network List Manager Policies) is forcing it.'
+            Add-Fix $r (New-Fix 'set-private' 'Mark the Tailscale network as Private' -Auto -Primary)
+        }
+    }
+    try {
+        $icmp = @(Get-NetFirewallRule -Enabled True -Direction Inbound -Action Allow -ErrorAction Stop | Where-Object { $_.DisplayName -like 'Tailscale Doctor - allow ping*' -or $_.DisplayName -match 'Echo Request - ICMPv4-In' })
+        $mine = @($icmp | Where-Object { $_.DisplayName -like 'Tailscale Doctor*' })
+        $r.details += ('Inbound ping allowed: ' + $(if ($icmp.Count) { 'yes (' + $icmp.Count + ' rule(s))' } else { 'no' }))
+        if (-not $icmp.Count) {
+            Set-Status $r 'info' 'Ping to this PC is blocked by Windows Firewall (normal Windows default). Everything else can still work.'
+            $r.advice += '"Ping doesn''t work but Tailscale is connected" is usually only this. Allow it if you use ping to test connectivity.'
+        }
+        if (-not $mine.Count) { Add-Fix $r (New-Fix 'allow-ping' 'Allow ping from Tailscale devices') }
+    } catch { }
+    $r.details += 'Note: the Windows tray showing "No internet access" for the Tailscale network is normal and harmless unless you use an exit node.'
+    if ($r.status -eq 'ok') { $r.summary = 'Tailscale network is Private; other devices can reach this PC.' }
+    return $r
+}
+
+function Test-MagicDns {
+    $r = New-Result 'magicdns' 'Device names (MagicDNS)'
+    if (-not $script:IsWin) { $r.status = 'skip'; $r.summary = 'Windows only'; return $r }
+    $st = Get-TsStatus
+    if (-not ($st.reachable -and $st.json.BackendState -eq 'Running')) { $r.status = 'skip'; $r.summary = 'Only checked while Tailscale is connected.'; return $r }
+    $j = $st.json
+    $prefs = Get-TsPrefs
+    if ($prefs -and ($prefs.PSObject.Properties.Name -contains 'CorpDNS') -and -not $prefs.CorpDNS) {
+        Set-Status $r 'info' 'This PC ignores Tailscale DNS settings (--accept-dns=false), so device names like "my-server" will not resolve.'
+        Add-Fix $r (New-Fix 'enable-dns' 'Use Tailscale DNS settings')
+        return $r
+    }
+    $enabled = $true
+    if ($j.CurrentTailnet -and ($j.CurrentTailnet.PSObject.Properties.Name -contains 'MagicDNSEnabled')) { $enabled = [bool]$j.CurrentTailnet.MagicDNSEnabled }
+    if (-not $enabled) { $r.status = 'info'; $r.summary = 'MagicDNS is turned off for your tailnet (admin console > DNS).'; return $r }
+    $name = ([string]$j.Self.DNSName).TrimEnd('.')
+    if (-not $name) { $r.status = 'skip'; $r.summary = 'This device has no MagicDNS name yet.'; return $r }
+    $myIps = @($j.TailscaleIPs)
+
+    # 1. GPO-managed NRPT silently overrides the local rules Tailscale writes
+    #    (common on domain-joined PCs).
+    $gpoNrpt = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient\DnsPolicyConfig'
+    $gpoRules = @()
+    try { if (Test-Path $gpoNrpt) { $gpoRules = @(Get-ChildItem $gpoNrpt -ErrorAction Stop) } } catch { }
+    if ($gpoRules.Count) {
+        $r.details += "Group Policy NRPT rules present: $($gpoRules.Count) (these override Tailscale's DNS rules)"
+    }
+    try {
+        $nrpt = @(Get-DnsClientNrptRule -ErrorAction Stop | Where-Object { @($_.NameServers) -contains '100.100.100.100' })
+        $r.details += ('Tailscale DNS rules (NRPT): ' + $(if ($nrpt.Count) { (($nrpt | ForEach-Object { @($_.Namespace) -join ',' }) -join '; ') } else { 'none' }))
+    } catch { $nrpt = @() }
+
+    # 2. Resolve our own name through Windows, and directly through Tailscale's resolver.
+    $sys = Resolve-HostSafe $name 6000
+    $r.details += "Windows resolves $name -> " + $(if ($sys.ok) { $sys.addresses -join ', ' } else { 'FAILED: ' + $sys.error })
+    $direct = $null
+    try {
+        $d = Resolve-DnsName -Name $name -Server '100.100.100.100' -DnsOnly -QuickTimeout -ErrorAction Stop | Where-Object { $_.IPAddress }
+        $direct = @($d | ForEach-Object { $_.IPAddress })
+        $r.details += "Tailscale resolver (100.100.100.100) -> " + ($direct -join ', ')
+    } catch { $r.details += 'Tailscale resolver (100.100.100.100) -> FAILED: ' + (Get-InnerMessage $_) }
+
+    $sysOk = $sys.ok -and @($sys.addresses | Where-Object { $myIps -contains $_ }).Count
+    if ($sysOk) { $r.summary = "Device names resolve ($name)."; return $r }
+    if ($direct -and $direct.Count) {
+        Set-Status $r 'fail' 'Tailscale''s DNS works, but Windows is not sending tailnet names to it.'
+        if ($gpoRules.Count) { $r.advice += 'Your domain''s Group Policy defines DNS (NRPT) rules, which makes Windows ignore the rules Tailscale adds. Ask your IT admin to add a GPO NRPT rule: namespace ".ts.net" (and your tailnet domain) -> 100.100.100.100.' }
+        $r.advice += 'Flushing DNS and restarting Tailscale re-applies its DNS rules. Workaround: use the full name (e.g. server.tailXXXX.ts.net) or the 100.x.y.z address.'
+        Add-Fix $r (New-Fix 'dns-repair' 'Re-apply Tailscale DNS (flush + restart)' -Auto -Primary)
+    } else {
+        Set-Status $r 'fail' 'Tailscale''s DNS resolver (100.100.100.100) is not answering.'
+        $r.advice += 'Restart the Tailscale service. If this keeps happening, a VPN or security product may be intercepting DNS (UDP/TCP port 53) - check those checks.'
+        Add-Fix $r (New-Fix 'dns-repair' 'Re-apply Tailscale DNS (flush + restart)' -Auto -Primary)
+    }
+    return $r
+}
+
+$script:WatchdogTask = 'Tailscale Doctor Watchdog'
+
+function Test-Watchdog {
+    $r = New-Result 'watchdog' 'Self-healing (after sleep, crashes, stuck states)'
+    if (-not $script:IsWin) { $r.status = 'skip'; $r.summary = 'Windows only'; return $r }
+    if (-not (Get-TsExe)) { $r.status = 'skip'; $r.summary = 'Tailscale is not installed'; return $r }
+    $task = $null
+    try { $task = Get-ScheduledTask -TaskName $script:WatchdogTask -ErrorAction Stop } catch { }
+    $script = Join-Path $script:DataDir 'watchdog.ps1'
+    if (-not $task -or -not (Test-Path -LiteralPath $script)) {
+        Set-Status $r 'warn' 'Not installed: if Tailscale gets stuck after sleep or a network change, nobody fixes it until someone notices.'
+        $r.advice += 'The watchdog is a small scheduled task (runs as SYSTEM every 10 minutes, at startup and on wake from sleep). It starts the service if stopped and restarts it if it hangs or stays stuck in "Starting". It never logs in or changes settings. Remove it any time from this page.'
+        Add-Fix $r (New-Fix 'install-watchdog' 'Install self-healing watchdog' -Auto -Primary)
+        return $r
+    }
+    $r.details += "Scheduled task: $($task.State)"
+    try {
+        $info = Get-ScheduledTaskInfo -TaskName $script:WatchdogTask -ErrorAction Stop
+        $r.details += "Last run: $($info.LastRunTime) (result 0x$('{0:X}' -f [int64]$info.LastTaskResult)); next: $($info.NextRunTime)"
+    } catch { }
+    $wlog = Join-Path $script:DataDir 'watchdog.log'
+    if (Test-Path -LiteralPath $wlog) {
+        $tail = Get-Tail (Read-FileTail $wlog 20000) 8
+        if ($tail) { $r.details += "Recent watchdog repairs:`n$tail" }
+    }
+    if ([string]$task.State -eq 'Disabled') {
+        Set-Status $r 'warn' 'The watchdog task is disabled.'
+        Add-Fix $r (New-Fix 'install-watchdog' 'Re-install watchdog' -Auto -Primary)
+    } else { $r.summary = 'Installed and active.' }
+    Add-Fix $r (New-Fix 'remove-watchdog' 'Remove watchdog' -Confirm 'Remove the Tailscale Doctor watchdog scheduled task?')
+    return $r
+}
+
+# The watchdog runs as SYSTEM from Task Scheduler under Windows PowerShell 5.1.
+# It only restarts things; it never logs in or changes Tailscale settings.
+$script:WatchdogScript = @'
+# Tailscale Doctor watchdog. Installed by Tailscale Doctor; remove it from there.
+$ErrorActionPreference = 'SilentlyContinue'
+$dir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$log = Join-Path $dir 'watchdog.log'
+function L([string]$m) { Add-Content -Path $log -Value ('[' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '] ' + $m) }
+try { if ((Get-Item -LiteralPath $log).Length -gt 1MB) { Move-Item -LiteralPath $log -Destination ($log + '.old') -Force } } catch { }
+
+function Get-State([string]$exe) {
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = $exe; $psi.Arguments = 'status --json --peers=false'
+    $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
+    try { $p = [Diagnostics.Process]::Start($psi) } catch { return 'no answer' }
+    $out = $p.StandardOutput.ReadToEndAsync(); $null = $p.StandardError.ReadToEndAsync()
+    if (-not $p.WaitForExit(20000)) { try { $p.Kill() } catch { }; return 'hung' }
+    try { $s = ($out.Result | ConvertFrom-Json).BackendState } catch { $s = $null }
+    if (-not $s) { return 'no answer' }
+    return $s
+}
+function Restart-Ts([string]$why) {
+    L "Restarting Tailscale service: $why"
+    Stop-Service -Name Tailscale -Force -NoWait
+    $deadline = (Get-Date).AddSeconds(20)
+    while ((Get-Date) -lt $deadline -and [string](Get-Service Tailscale).Status -ne 'Stopped') { Start-Sleep -Milliseconds 500 }
+    if ([string](Get-Service Tailscale).Status -ne 'Stopped') { Get-Process -Name tailscaled | Stop-Process -Force; Start-Sleep -Seconds 3 }
+    Start-Service -Name Tailscale
+    L ("Service is now " + (Get-Service Tailscale).Status)
+}
+
+$svc = Get-Service -Name Tailscale
+if (-not $svc) { exit 0 }
+if ([string]$svc.StartType -eq 'Disabled') { exit 0 }   # someone disabled it on purpose
+if ([string]$svc.Status -match 'Pending') { Start-Sleep -Seconds 30; $svc.Refresh(); if ([string]$svc.Status -match 'Pending') { Restart-Ts "stuck in $($svc.Status)"; exit 0 } }
+if ([string]$svc.Status -ne 'Running') { L "Service was $($svc.Status); starting it."; Start-Service -Name Tailscale; exit 0 }
+
+$exe = '__TSEXE__'
+if (-not (Test-Path -LiteralPath $exe)) { $exe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe' }
+if (-not (Test-Path -LiteralPath $exe)) { exit 0 }
+
+# NeedsLogin / Stopped / NeedsMachineAuth need a human; only fix hung or stuck states.
+$bad = @('hung', 'no answer', 'Starting', 'NoState')
+$s1 = Get-State $exe
+if ($bad -notcontains $s1) { exit 0 }
+Start-Sleep -Seconds 60
+$s2 = Get-State $exe
+if ($bad -contains $s2) { Restart-Ts "state was '$s1', then '$s2' a minute later" }
+'@
+
 $script:Checks = @(
     @{ id = 'system'; title = 'Windows and permissions'; fn = ${function:Test-System} },
+    @{ id = 'deps'; title = 'Windows services Tailscale needs'; fn = ${function:Test-Dependencies} },
     @{ id = 'install'; title = 'Tailscale installation'; fn = ${function:Test-Install} },
     @{ id = 'service'; title = 'Tailscale Windows service'; fn = ${function:Test-Service} },
     @{ id = 'daemon'; title = 'Tailscale service responding'; fn = ${function:Test-Daemon} },
@@ -1636,10 +1942,13 @@ $script:Checks = @(
     @{ id = 'firewall'; title = 'Windows Firewall'; fn = ${function:Test-Firewall} },
     @{ id = 'ts2021'; title = 'Control-plane handshake'; fn = ${function:Test-Ts2021} },
     @{ id = 'backend'; title = 'Login and connection state'; fn = ${function:Test-Backend} },
+    @{ id = 'magicdns'; title = 'Device names (MagicDNS)'; fn = ${function:Test-MagicDns} },
+    @{ id = 'inbound'; title = 'Reaching this PC over Tailscale'; fn = ${function:Test-Inbound} },
     @{ id = 'netcheck'; title = 'Relay and UDP connectivity'; fn = ${function:Test-Netcheck} },
     @{ id = 'update'; title = 'Tailscale version'; fn = ${function:Test-Update} },
     @{ id = 'policy'; title = 'Tailscale policies'; fn = ${function:Test-Policy} },
     @{ id = 'state'; title = 'Tailscale state files'; fn = ${function:Test-State} },
+    @{ id = 'watchdog'; title = 'Self-healing watchdog'; fn = ${function:Test-Watchdog} },
     @{ id = 'logs'; title = 'Tailscale service logs'; fn = ${function:Test-Logs} }
 )
 
@@ -1761,6 +2070,18 @@ function Restart-TailscaleService($A, [switch]$StartOnly) {
 
 function Install-Tailscale($A, [string]$Mode) {
     if (-not $script:IsWin) { Add-Step $A 'Installation is only supported on Windows.' 'error'; return $false }
+    # Pre-flight: problems that make the MSI fail however often it is retried.
+    $deps = Test-Dependencies
+    if ($deps.status -eq 'fail') {
+        Add-Step $A 'Some Windows services the installer needs are disabled; re-enabling them first.' 'warn'
+        $sub = Invoke-Action 'fix-dependencies' $null
+        $A.steps += $sub.steps
+    }
+    try {
+        $sysDrive = if ($env:SystemDrive) { $env:SystemDrive } else { 'C:' }
+        $free = (Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$sysDrive'" -OperationTimeoutSec 20 -ErrorAction Stop).FreeSpace
+        if ($free -lt 400MB) { throw "Only $([int]($free / 1MB)) MB free on $sysDrive. Free up at least 400 MB and try again." }
+    } catch { if ((Get-InnerMessage $_) -match 'free on') { throw } }
     $arch = Get-OsArch
     $script:Cache.Remove('latest')
     $lat = Get-LatestRelease
@@ -2137,6 +2458,125 @@ function Invoke-Action([string]$Name, $P) {
                 if ($id) { Add-Step $A "Bug report ID: $id (give this to Tailscale support)"; $A.data.bugreport = $id; $A.ok = $true }
                 else { Add-Step $A ('Could not create a bug report: ' + (Get-Tail $p.output 4)) 'error' }
             }
+            'fix-dependencies' {
+                $needReboot = $false
+                foreach ($d in $script:DependencyServices) {
+                    $s = Get-Service -Name $d.name -ErrorAction SilentlyContinue
+                    if (-not $s) { continue }
+                    if ([string]$s.StartType -eq 'Disabled') {
+                        try { Set-Service -Name $d.name -StartupType $d.start -ErrorAction Stop; Add-Step $A "$($d.label): start type set to $($d.start)." }
+                        catch {
+                            # Protected services refuse Set-Service; the registry value works after a reboot.
+                            try {
+                                $v = if ($d.start -eq 'Automatic') { 2 } else { 3 }
+                                Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$($d.name)" -Name Start -Value $v -Type DWord -ErrorAction Stop
+                                Add-Step $A "$($d.label): re-enabled in the registry (takes effect after a reboot)." 'warn'
+                                $needReboot = $true
+                            } catch { Add-Step $A "$($d.label): could not re-enable: $(Get-InnerMessage $_)" 'error' }
+                        }
+                    }
+                    if ($d.running) {
+                        $s = Get-Service -Name $d.name -ErrorAction SilentlyContinue
+                        if ($s -and [string]$s.Status -ne 'Running' -and [string]$s.StartType -ne 'Disabled') {
+                            try { Start-Service -Name $d.name -ErrorAction Stop; Add-Step $A "$($d.label): started." }
+                            catch { Add-Step $A "$($d.label): could not start: $(Get-InnerMessage $_)" 'warn'; $needReboot = $true }
+                        }
+                    }
+                }
+                if ($needReboot) { $script:RebootNeeded = $true; $A.hints += 'Reboot Windows, then run Tailscale Doctor again.' }
+                $A.ok = -not $needReboot
+            }
+            'set-private' {
+                $prof = @(Get-NetConnectionProfile -ErrorAction Stop | Where-Object { $_.InterfaceAlias -like 'Tailscale*' })
+                foreach ($p in $prof) {
+                    Set-NetConnectionProfile -InterfaceIndex $p.InterfaceIndex -NetworkCategory Private -ErrorAction Stop
+                    Add-Step $A "Network '$($p.InterfaceAlias)' is now Private."
+                }
+                $check = @(Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like 'Tailscale*' -and [string]$_.NetworkCategory -eq 'Public' })
+                $A.ok = ($prof.Count -gt 0 -and $check.Count -eq 0)
+                if ($check.Count) { $A.hints += 'Windows reverted it to Public: a Group Policy (Network List Manager Policies) is enforcing the category. Ask your IT admin.' }
+            }
+            'allow-ping' {
+                foreach ($proto in @(@{ p = 'ICMPv4'; t = '8' }, @{ p = 'ICMPv6'; t = '128' })) {
+                    $name = "Tailscale Doctor - allow ping from tailnet ($($proto.p))"
+                    Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+                    $remote = if ($proto.p -eq 'ICMPv4') { '100.64.0.0/10' } else { 'fd7a:115c:a1e0::/48' }
+                    New-NetFirewallRule -DisplayName $name -Direction Inbound -Protocol $proto.p -IcmpType $proto.t -RemoteAddress $remote -Action Allow -Profile Any -ErrorAction Stop | Out-Null
+                    Add-Step $A "Added rule: $name (only from Tailscale addresses)"
+                }
+                $A.ok = $true
+            }
+            'enable-dns' {
+                $p = Invoke-Ts @('set', '--accept-dns=true') 30
+                if (-not $p.ok) { $p = Invoke-TsWithFallback $A @('up', '--accept-dns=true') 60 }
+                Add-Step $A ('Tailscale says: ' + $(if ($p.output) { Get-Tail $p.output 3 } else { 'OK' }))
+                $A.ok = $p.ok
+            }
+            'dns-repair' {
+                try { Clear-DnsClientCache -ErrorAction Stop } catch { }
+                [void](Invoke-Proc 'ipconfig.exe' @('/flushdns') 15)
+                Add-Step $A 'DNS cache flushed.'
+                $A.ok = Restart-TailscaleService $A
+                try { Clear-DnsClientCache -ErrorAction Stop } catch { }
+            }
+            'clear-exit-node' {
+                $p = Invoke-Ts @('set', '--exit-node=') 30
+                if (-not $p.ok) { $p = Invoke-TsWithFallback $A @('up', '--exit-node=') 60 }
+                Add-Step $A ('Exit node cleared. ' + (Get-Tail $p.output 3))
+                $A.ok = $p.ok
+                if ($A.ok) { $A.hints += 'Internet traffic now goes directly out of this PC again. Pick a working exit node in the Tailscale tray menu if you need one.' }
+            }
+            'disable-teredo' {
+                $p = Invoke-Proc 'netsh.exe' @('interface', 'teredo', 'set', 'state', 'disabled') 20
+                Add-Step $A ('netsh: ' + (Get-Tail $p.output 2))
+                $A.ok = $p.ok
+            }
+            'tpm-recover' {
+                $f = Join-Path $env:ProgramData 'Tailscale\server-state.conf'
+                Add-Step $A 'Stopping Tailscale (service and tray app)...'
+                Get-Process -Name 'tailscale-ipn' -ErrorAction SilentlyContinue | ForEach-Object { Stop-ProcessTree $_.Id }
+                try { Stop-Service -Name Tailscale -Force -ErrorAction Stop } catch { }
+                if (-not (Wait-ServiceState 'Stopped' 20)) { Get-Process -Name tailscaled -ErrorAction SilentlyContinue | ForEach-Object { Stop-ProcessTree $_.Id }; Start-Sleep -Seconds 3 }
+                if (Test-Path -LiteralPath $f) {
+                    $bak = $f + '.tpm-broken-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.bak'
+                    Move-Item -LiteralPath $f -Destination $bak -Force -ErrorAction Stop
+                    Add-Step $A "Unreadable state file moved to $bak"
+                } else { Add-Step $A 'No state file found; just restarting.' }
+                $A.ok = Restart-TailscaleService $A -StartOnly
+                if ($A.ok) { Add-Step $A 'Tailscale starts fresh. Log in again (in the admin console, remove the old duplicate of this machine).' }
+            }
+            'install-watchdog' {
+                $script = Join-Path $script:DataDir 'watchdog.ps1'
+                $exe = Get-TsExe
+                [IO.File]::WriteAllText($script, ($script:WatchdogScript -replace '__TSEXE__', ($exe -replace "'", "''")), (New-Object Text.UTF8Encoding $true))
+                Add-Step $A "Wrote $script"
+                $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+                $action = New-ScheduledTaskAction -Execute $ps -Argument ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $script + '"')
+                $triggers = @(New-ScheduledTaskTrigger -AtStartup)
+                $triggers[0].Delay = 'PT2M'
+                try { $triggers += New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) -RepetitionInterval (New-TimeSpan -Minutes 10) }
+                catch { $triggers += New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) -RepetitionInterval (New-TimeSpan -Minutes 10) -RepetitionDuration (New-TimeSpan -Days 3650) }
+                try {
+                    $cls = Get-CimClass -Namespace 'root/Microsoft/Windows/TaskScheduler' -ClassName 'MSFT_TaskEventTrigger' -ErrorAction Stop
+                    $wake = New-CimInstance -CimClass $cls -ClientOnly
+                    $wake.Enabled = $true
+                    $wake.Delay = 'PT1M'
+                    $wake.Subscription = '<QueryList><Query Id="0" Path="System"><Select Path="System">*[System[Provider[@Name=''Microsoft-Windows-Power-Troubleshooter''] and EventID=1]]</Select></Query></QueryList>'
+                    $triggers += $wake
+                    Add-Step $A 'Trigger: 1 minute after waking from sleep.'
+                } catch { Add-Step $A ('Could not add the wake-from-sleep trigger: ' + (Get-InnerMessage $_)) 'warn' }
+                $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+                $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+                Register-ScheduledTask -TaskName $script:WatchdogTask -Action $action -Trigger $triggers -Principal $principal -Settings $settings -Description 'Installed by Tailscale Doctor. Starts or restarts the Tailscale service if it is stopped, hung, or stuck. Never changes settings or logs in.' -Force -ErrorAction Stop | Out-Null
+                Add-Step $A "Scheduled task '$($script:WatchdogTask)' installed (startup, every 10 minutes, after sleep)."
+                $A.ok = $true
+            }
+            'remove-watchdog' {
+                Unregister-ScheduledTask -TaskName $script:WatchdogTask -Confirm:$false -ErrorAction Stop
+                Remove-Item -LiteralPath (Join-Path $script:DataDir 'watchdog.ps1') -Force -ErrorAction SilentlyContinue
+                Add-Step $A 'Watchdog removed.'
+                $A.ok = $true
+            }
             default { throw "Unknown action '$Name'" }
         }
     } catch {
@@ -2150,6 +2590,31 @@ function Invoke-Action([string]$Name, $P) {
     Write-Log "=== Action $Name finished: $($A.message) ===" $(if ($A.ok) { 'info' } else { 'warn' })
     return $A
 }
+
+if ($LoadOnly) { return }
+
+# ---------------------------------------------------------------------------
+# Startup housekeeping
+# ---------------------------------------------------------------------------
+
+# Only Administrators and SYSTEM may change files here: the SYSTEM watchdog runs
+# a script from this folder and installers are downloaded into it.
+function Protect-DataDir {
+    if (-not ($script:IsWin -and $script:IsAdmin)) { return }
+    $p = Invoke-Proc 'icacls.exe' @($script:DataDir, '/inheritance:r', '/grant:r', '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-545:(OI)(CI)RX', '/T', '/C', '/Q') 60 -Quiet
+    if (-not $p.ok) { Write-Log ('Could not restrict permissions on ' + $script:DataDir + ': ' + $p.output) 'warn' }
+}
+# Files readable only by Administrators/SYSTEM (the session URL contains the access token).
+function Protect-File([string]$Path) {
+    if (-not ($script:IsWin -and $script:IsAdmin)) { return }
+    [void](Invoke-Proc 'icacls.exe' @($Path, '/inheritance:r', '/grant:r', '*S-1-5-32-544:F', '*S-1-5-18:F') 20 -Quiet)
+}
+try { Protect-DataDir } catch { }
+try {
+    Get-ChildItem -LiteralPath $script:DataDir -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^(doctor-|msi-|report-).*\.(log|json)$' -and $_.LastWriteTime -lt (Get-Date).AddDays(-30) } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+} catch { }
 
 # ---------------------------------------------------------------------------
 # CLI mode
@@ -2284,6 +2749,29 @@ function Invoke-Request($Ctx) {
     }
 }
 
+# One doctor at a time: two copies would fight over the service. A second launch
+# just reopens the page of the one already running.
+$script:UrlFile = Join-Path $script:DataDir 'current-session.txt'
+$script:Mutex = $null
+try {
+    $script:Mutex = New-Object Threading.Mutex($false, 'Global\TailscaleDoctor')
+    $owned = $false
+    try { $owned = $script:Mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $owned = $true }
+    if (-not $owned) {
+        $existing = (Read-SharedText $script:UrlFile).Trim()
+        if ($existing -match '^http://') {
+            Write-Host 'Tailscale Doctor is already running. Opening its page...' -ForegroundColor Yellow
+            try { Start-Process -FilePath 'explorer.exe' -ArgumentList ('"' + $existing + '"') -ErrorAction Stop } catch { try { Start-Process $existing -ErrorAction Stop } catch { } }
+            Write-Host "If nothing opens, use: $existing"
+        } else {
+            Write-Host 'Tailscale Doctor is already running in another window. Use that one, or close it first.' -ForegroundColor Yellow
+        }
+        Start-Sleep -Seconds 5
+        $script:AlreadyRunning = $true
+    }
+} catch { Write-Log ('Single-instance check skipped: ' + (Get-InnerMessage $_)) 'debug' }
+if ($script:AlreadyRunning) { exit 0 }
+
 $script:Token = New-Token
 $listener = $null
 $script:UrlHost = '127.0.0.1'
@@ -2304,6 +2792,7 @@ if (-not $listener) {
 }
 
 $url = "http://$($script:UrlHost):$script:ActualPort/?t=$script:Token"
+try { [IO.File]::WriteAllText($script:UrlFile, $url); Protect-File $script:UrlFile } catch { }
 try { $Host.UI.RawUI.WindowTitle = 'Tailscale Doctor - keep this window open' } catch { }
 Write-Host ''
 Write-Host '  Tailscale Doctor is running.' -ForegroundColor Cyan
@@ -2340,6 +2829,8 @@ try {
 } finally {
     Write-Log 'Shutting down.'
     try { $listener.Stop(); $listener.Close() } catch { }
+    try { Remove-Item -LiteralPath $script:UrlFile -Force -ErrorAction SilentlyContinue } catch { }
+    try { if ($script:Mutex) { $script:Mutex.ReleaseMutex(); $script:Mutex.Dispose() } } catch { }
     if ($script:LoginProc -and -not $script:LoginProc.HasExited) {
         # Leave a pending browser login running: it completes on its own once approved.
     }
